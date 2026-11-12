@@ -1,0 +1,5 @@
+source_system,entity_id,journal_id,line_number,account_code,posting_date,currency,debit,credit
+demo_erp,LEG1,J1000,1,5000,2026-01-05,USD,1000.00,0.00
+demo_erp,LEG1,J1000,2,1000,2026-01-05,USD,0.00,1000.00
+demo_erp,LEG1,J1001,1,5000,2026-01-06,USD,200.00,0.00
+demo_erp,LEG1,J1001,2,1000,2026-01-06,USD,0.00,200.00

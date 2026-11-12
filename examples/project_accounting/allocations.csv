@@ -1,0 +1,7 @@
+source_system,entity_id,journal_id,line_number,project_id,weight
+demo_erp,LEG1,J1000,1,P100,0.60
+demo_erp,LEG1,J1000,1,P200,0.40
+demo_erp,LEG1,J1000,2,P100,0.60
+demo_erp,LEG1,J1000,2,P200,0.40
+demo_erp,LEG1,J1001,1,P100,1.00
+demo_erp,LEG1,J1001,2,P100,1.00
