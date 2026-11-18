@@ -31,6 +31,7 @@ class DataType(StrEnum):
     INTEGER = "BIGINT"
     DATE = "DATE"
     TIMESTAMP = "TIMESTAMPTZ"
+    BOOLEAN = "BOOLEAN"
     AMOUNT = "DECIMAL(18, 2)"
     WEIGHT = "DECIMAL(18, 8)"
 
@@ -105,6 +106,45 @@ class Allocation:
     group_by: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class Incremental:
+    cursor: str
+
+    def __post_init__(self) -> None:
+        identifier(self.cursor)
+
+
+@dataclass(frozen=True)
+class SCD2:
+    tracked_columns: tuple[str, ...]
+    valid_from: str = "valid_from"
+    valid_to: str = "valid_to"
+    current_flag: str = "is_current"
+
+    def __post_init__(self) -> None:
+        for name in (*self.tracked_columns, self.valid_from, self.valid_to, self.current_flag):
+            identifier(name)
+        if not self.tracked_columns or len(set(self.tracked_columns)) != len(self.tracked_columns):
+            raise ModelError("SCD2 requires non-empty, unique tracked columns")
+        if len({self.valid_from, self.valid_to, self.current_flag}) != 3:
+            raise ModelError("SCD2 validity column names must be distinct")
+
+
+@dataclass(frozen=True)
+class TemporalLookup:
+    columns: tuple[str, ...]
+    target: str
+    time_column: str
+    surrogate_column: str
+
+    def __post_init__(self) -> None:
+        qualified_name(self.target)
+        for name in (*self.columns, self.time_column, self.surrogate_column):
+            identifier(name)
+        if not self.columns or len(set(self.columns)) != len(self.columns):
+            raise ModelError("Temporal lookup requires non-empty, unique business-key columns")
+
+
 @dataclass(frozen=True, kw_only=True)
 class Table:
     name: str
@@ -114,6 +154,7 @@ class Table:
     depends_on: tuple[str, ...] = ()
     references: tuple[Reference, ...] = ()
     checks: tuple[Check, ...] = ()
+    incremental: Incremental | None = None
 
     def __post_init__(self) -> None:
         qualified_name(self.name)
@@ -134,6 +175,11 @@ class Table:
         check_names = [check.name for check in self.checks]
         if len(set(check_names)) != len(check_names):
             raise ModelError(f"{self.name}: repeated check name")
+        if self.incremental is not None:
+            self.require_columns((self.incremental.cursor,))
+            cursor = next(c for c in self.columns if c.name == self.incremental.cursor)
+            if cursor.data_type != DataType.TIMESTAMP or cursor.nullable:
+                raise ModelError(f"{self.name}: incremental cursor must be non-null TIMESTAMP")
 
     def require_columns(self, names: tuple[str, ...]) -> None:
         missing = set(names) - {column.name for column in self.columns}
@@ -153,17 +199,54 @@ class Table:
 class Dimension(Table):
     business_key: tuple[str, ...]
     surrogate_key: str
+    history: SCD2 | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.require_key(self.business_key)
         if self.grain != (self.surrogate_key,):
             raise ModelError(f"{self.name}: dimension grain must be its surrogate key")
+        if self.history is not None:
+            history = self.history
+            if self.incremental is None:
+                raise ModelError(f"{self.name}: SCD2 requires an incremental cursor")
+            columns = {c.name: c for c in self.columns}
+            required = (
+                history.valid_from,
+                history.valid_to,
+                history.current_flag,
+                *history.tracked_columns,
+            )
+            self.require_columns(required)
+            if columns[self.surrogate_key].data_type != DataType.TEXT:
+                raise ModelError(f"{self.name}: SCD2 surrogate key must be TEXT")
+            for name, data_type, nullable in (
+                (history.valid_from, DataType.TIMESTAMP, False),
+                (history.valid_to, DataType.TIMESTAMP, True),
+                (history.current_flag, DataType.BOOLEAN, False),
+            ):
+                if columns[name].data_type != data_type or columns[name].nullable != nullable:
+                    raise ModelError(f"{self.name}: invalid SCD2 column {name}")
+            roles = (
+                *self.business_key,
+                self.surrogate_key,
+                self.incremental.cursor,
+                history.valid_from,
+                history.valid_to,
+                history.current_flag,
+                *history.tracked_columns,
+            )
+            if len(set(roles)) != len(roles) or set(roles) != set(columns):
+                raise ModelError(
+                    f"{self.name}: SCD2 key, cursor, validity and tracked columns "
+                    "must be distinct and cover every column"
+                )
 
 
 @dataclass(frozen=True, kw_only=True)
 class Fact(Table):
     measures: tuple[Measure, ...]
+    temporal_lookups: tuple[TemporalLookup, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -180,6 +263,27 @@ class Fact(Table):
                 currency = columns[measure.currency_column]
                 if currency.data_type != DataType.TEXT or currency.nullable:
                     raise ModelError(f"{self.name}: currency must be non-null text")
+        outputs = [lookup.surrogate_column for lookup in self.temporal_lookups]
+        if len(set(outputs)) != len(outputs):
+            raise ModelError(f"{self.name}: repeated temporal lookup output")
+        for lookup in self.temporal_lookups:
+            self.require_columns((*lookup.columns, lookup.time_column, lookup.surrogate_column))
+            if lookup.target not in self.depends_on:
+                raise ModelError(f"{self.name}: temporal target must be an explicit dependency")
+            if columns[lookup.time_column].data_type not in (DataType.DATE, DataType.TIMESTAMP):
+                raise ModelError(f"{self.name}: temporal event time must be DATE or TIMESTAMP")
+            if any(
+                columns[name].nullable
+                for name in (*lookup.columns, lookup.time_column, lookup.surrogate_column)
+            ):
+                raise ModelError(f"{self.name}: temporal lookup columns must be non-null")
+            if lookup.surrogate_column in (
+                *self.grain,
+                *lookup.columns,
+                lookup.time_column,
+                *((self.incremental.cursor,) if self.incremental else ()),
+            ):
+                raise ModelError(f"{self.name}: temporal surrogate must be a separate column")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -218,7 +322,7 @@ class Mart:
                 target = registry[reference.target]
                 target.require_columns(reference.target_columns)
                 keys = [target.grain]
-                if isinstance(target, Dimension):
+                if isinstance(target, Dimension) and target.history is None:
                     keys.append(target.business_key)
                 if reference.target_columns not in keys:
                     raise ModelError(
@@ -226,6 +330,25 @@ class Mart:
                     )
                 if isinstance(model, Fact) and not isinstance(target, Dimension):
                     raise ModelError(f"{model.name}: fact references must target dimensions")
+            if isinstance(model, Fact):
+                outputs = {lookup.surrogate_column for lookup in model.temporal_lookups}
+                if any(set(lookup.columns) & outputs for lookup in model.temporal_lookups):
+                    raise ModelError(f"{model.name}: temporal lookups cannot depend on each other")
+                for lookup in model.temporal_lookups:
+                    target = registry[lookup.target]
+                    if not isinstance(target, Dimension) or target.history is None:
+                        raise ModelError(f"{model.name}: temporal target must be an SCD2 dimension")
+                    if len(lookup.columns) != len(target.business_key):
+                        raise ModelError(f"{model.name}: temporal business-key size mismatch")
+                    source_types = {c.name: c.data_type for c in model.columns}
+                    target_types = {c.name: c.data_type for c in target.columns}
+                    for source, destination in zip(
+                        (*lookup.columns, lookup.surrogate_column),
+                        (*target.business_key, target.surrogate_key),
+                        strict=True,
+                    ):
+                        if source_types[source] != target_types[destination]:
+                            raise ModelError(f"{model.name}: temporal lookup type mismatch")
         graph = {model.name: model.depends_on for model in self.models}
         try:
             order = tuple(TopologicalSorter(graph).static_order())

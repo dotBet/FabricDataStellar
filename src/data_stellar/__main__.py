@@ -7,6 +7,22 @@ import duckdb
 
 from data_stellar.duckdb import DuckDBExecutor
 from data_stellar.example import build_project_accounting_mart
+from data_stellar.history_example import build_project_history_mart
+
+
+def _history_demo(database: Path, source_dir: Path) -> None:
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(database)) as connection:
+        executor = DuckDBExecutor(connection)
+        for batch in ("initial", "backdated"):
+            result = executor.run(build_project_history_mart(source_dir / batch))
+            print(f"{batch}: succeeded ({result.run_id})")
+            for entry_id, name, hours in connection.execute("""
+                SELECT entry_id, project_name, hours FROM gold.fact_project_time
+                JOIN gold.dim_project_history USING (project_key) ORDER BY entry_id
+            """).fetchall():
+                print(f"  {entry_id}: {name}, {hours} hours")
+        print(f"Database: {database.resolve()}")
 
 
 def main() -> None:
@@ -15,7 +31,15 @@ def main() -> None:
     demo = commands.add_parser("demo", help="Build the synthetic project-accounting mart")
     demo.add_argument("--database", type=Path, default=Path("output") / "project_accounting.duckdb")
     demo.add_argument("--source-dir", type=Path, default=Path("examples") / "project_accounting")
+    history = commands.add_parser(
+        "history-demo", help="Apply initial and backdated project changes with temporal fact repair"
+    )
+    history.add_argument("--database", type=Path, default=Path("output") / "project_history.duckdb")
+    history.add_argument("--source-dir", type=Path, default=Path("examples") / "project_history")
     args = parser.parse_args()
+    if args.command == "history-demo":
+        _history_demo(args.database, args.source_dir)
+        return
     mart = build_project_accounting_mart(args.source_dir)
     args.database.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(args.database)) as connection:

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import duckdb
 
-from data_stellar.models import Bridge, Dimension, Mart, Table, identifier, qualified_name
+from data_stellar.models import (
+    Bridge,
+    DataType,
+    Dimension,
+    Fact,
+    Mart,
+    Table,
+    identifier,
+    qualified_name,
+)
 
 
 class DataQualityError(RuntimeError):
@@ -45,7 +56,7 @@ class RunResult:
 
 
 class DuckDBExecutor:
-    """Atomically rebuild a mart from a complete source snapshot."""
+    """Atomically publish full-refresh and incremental models on a dedicated connection."""
 
     def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
         self.connection = connection
@@ -66,6 +77,14 @@ class DuckDBExecutor:
                 error VARCHAR
             )
         """)
+        self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS _stellar.model_state (
+                model_name VARCHAR PRIMARY KEY,
+                mart_name VARCHAR NOT NULL,
+                contract VARCHAR NOT NULL,
+                watermark TIMESTAMPTZ
+            )
+        """)
         self.connection.execute(
             "INSERT INTO _stellar.runs VALUES (?, ?, ?, ?, NULL, 'running', NULL)",
             [run_id, context.batch_id, mart.name, context.started_at],
@@ -81,7 +100,8 @@ class DuckDBExecutor:
                 "INSERT INTO _stellar_context VALUES (?, ?)",
                 [context.batch_id, context.started_at],
             )
-            counts = {model.name: self._materialize(model) for model in plan}
+            registry = {model.name: model for model in plan}
+            counts = {model.name: self._materialize(model, mart.name, registry) for model in plan}
             self.connection.execute(
                 """UPDATE _stellar.runs
                    SET status = 'succeeded', completed_at = current_timestamp
@@ -112,18 +132,53 @@ class DuckDBExecutor:
         if failures:
             raise DataQualityError(f"{model.name}: {rule} ({failures} violations)")
 
-    def _materialize(self, model: Table) -> int:
+    def _materialize(self, model: Table, mart_name: str, registry: dict[str, Table]) -> int:
         try:
-            self.connection.execute(f"CREATE OR REPLACE TEMP TABLE _stellar_stage AS {model.query}")
+            self.connection.execute(f"CREATE OR REPLACE TEMP TABLE _stellar_query AS {model.query}")
             actual = tuple(
                 row[1]
-                for row in self.connection.execute("PRAGMA table_info('_stellar_stage')").fetchall()
+                for row in self.connection.execute("PRAGMA table_info('_stellar_query')").fetchall()
             )
-            expected = tuple(column.name for column in model.columns)
+            managed: set[str] = set()
+            if isinstance(model, Dimension) and model.history is not None:
+                managed = {
+                    model.surrogate_key,
+                    model.history.valid_to,
+                    model.history.current_flag,
+                }
+            if isinstance(model, Fact):
+                managed = {lookup.surrogate_column for lookup in model.temporal_lookups}
+            inputs = tuple(column for column in model.columns if column.name not in managed)
+            expected = tuple(column.name for column in inputs)
             if set(actual) != set(expected):
                 raise DataQualityError(
                     f"{model.name}: query columns {actual} do not match declared columns {expected}"
                 )
+            input_definitions = ", ".join(
+                f"{quote(column.name)} {column.data_type.value}"
+                f"{'' if column.nullable else ' NOT NULL'}"
+                for column in inputs
+            )
+            input_columns = ", ".join(quote(column.name) for column in inputs)
+            self.connection.execute(
+                f"CREATE OR REPLACE TEMP TABLE _stellar_stage ({input_definitions})"
+            )
+            self.connection.execute(
+                f"INSERT INTO _stellar_stage SELECT {input_columns} FROM _stellar_query"
+            )
+            self.connection.execute("DROP TABLE _stellar_query")
+            if model.incremental is not None:
+                self._incremental(model, mart_name, input_columns)
+            elif self.connection.execute(
+                "SELECT 1 FROM _stellar.model_state WHERE model_name = ?", [model.name]
+            ).fetchone():
+                raise DataQualityError(
+                    f"{model.name}: cannot switch a stateful model to full refresh"
+                )
+            if isinstance(model, Dimension) and model.history is not None:
+                self._history(model)
+            if isinstance(model, Fact):
+                self._temporal(model, registry)
             schema, _ = qualified_name(model.name)
             self.connection.execute(f"CREATE SCHEMA IF NOT EXISTS {quote(schema)}")
             definitions = ", ".join(
@@ -144,7 +199,11 @@ class DuckDBExecutor:
     def _validate(self, model: Table) -> None:
         target = relation(model.name)
         keys = [model.grain]
-        if isinstance(model, Dimension) and model.business_key not in keys:
+        if (
+            isinstance(model, Dimension)
+            and model.history is None
+            and model.business_key not in keys
+        ):
             keys.append(model.business_key)
         for key in keys:
             columns = ", ".join(quote(name) for name in key)
@@ -152,6 +211,21 @@ class DuckDBExecutor:
                 model,
                 f"duplicate key {key}",
                 f"SELECT {columns} FROM {target} GROUP BY {columns} HAVING count(*) > 1",
+            )
+        if isinstance(model, Dimension) and model.history is not None:
+            history = model.history
+            start, end = quote(history.valid_from), quote(history.valid_to)
+            groups = ", ".join(quote(name) for name in model.business_key)
+            self._assert_empty(
+                model,
+                "invalid SCD2 intervals",
+                f"""SELECT 1 FROM (
+                    SELECT *, lead({start}) OVER (PARTITION BY {groups} ORDER BY {start}) next_start
+                    FROM {target}
+                ) versions
+                WHERE NOT isfinite({start}) OR ({end} IS NOT NULL AND {end} <= {start})
+                   OR {end} IS DISTINCT FROM next_start
+                   OR {quote(history.current_flag)} IS DISTINCT FROM ({end} IS NULL)""",
             )
         for check in model.checks:
             self._assert_empty(
@@ -188,3 +262,183 @@ class DuckDBExecutor:
                 "allocation weights must total one per group",
                 f"SELECT {groups} FROM {target} GROUP BY {groups} HAVING sum({weight}) <> 1",
             )
+
+    def _incremental(self, model: Table, mart_name: str, columns: str) -> None:
+        policy = model.incremental
+        assert policy is not None
+        history = model.history if isinstance(model, Dimension) else None
+        contract = json.dumps(
+            {
+                "columns": [asdict(column) for column in model.columns],
+                "grain": model.grain,
+                "incremental": asdict(policy),
+                "history": asdict(history) if history else None,
+                "business_key": model.business_key if isinstance(model, Dimension) else None,
+                "lookups": (
+                    [asdict(lookup) for lookup in model.temporal_lookups]
+                    if isinstance(model, Fact)
+                    else []
+                ),
+            },
+            sort_keys=True,
+        )
+        state = self.connection.execute(
+            "SELECT mart_name, contract, watermark FROM _stellar.model_state WHERE model_name = ?",
+            [model.name],
+        ).fetchone()
+        if state is not None and (state[0] != mart_name or state[1] != contract):
+            raise DataQualityError(
+                f"{model.name}: stateful contract/owner changed; migration required"
+            )
+        schema, table = qualified_name(model.name)
+        exists = self.connection.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+            [schema, table],
+        ).fetchone()
+        if state is None and exists:
+            raise DataQualityError(
+                f"{model.name}: cannot adopt existing table without loading state"
+            )
+        if state is not None and not exists:
+            raise DataQualityError(f"{model.name}: state exists but published table is missing")
+        cursor = quote(policy.cursor)
+        self._assert_empty(
+            model,
+            "incremental cursor must be finite",
+            f"SELECT 1 FROM _stellar_stage WHERE NOT isfinite({cursor})",
+        )
+        if state is not None and state[2] is not None:
+            self.connection.execute(f"DELETE FROM _stellar_stage WHERE {cursor} < ?", [state[2]])
+        if history is not None:
+            self._assert_empty(
+                model,
+                "SCD2 effective time must be finite",
+                f"SELECT 1 FROM _stellar_stage WHERE NOT isfinite({quote(history.valid_from)})",
+            )
+        keys = (
+            (*model.business_key, history.valid_from)
+            if isinstance(model, Dimension) and history is not None
+            else model.grain
+        )
+        groups = ", ".join(quote(name) for name in keys)
+        self._assert_empty(
+            model,
+            "duplicate incremental key",
+            f"SELECT {groups} FROM _stellar_stage GROUP BY {groups} HAVING count(*) > 1",
+        )
+        if history is not None:
+            digest = hashlib.sha256(model.name.encode()).hexdigest()[:24]
+            stored = f'_stellar."history_{digest}"'
+        else:
+            stored = relation(model.name)
+        if state is None:
+            self.connection.execute(
+                """INSERT INTO _stellar.model_state VALUES (?, ?, ?, NULL)""",
+                [model.name, mart_name, contract],
+            )
+            if history is not None:
+                self.connection.execute(
+                    f"CREATE TABLE {stored} AS SELECT * FROM _stellar_stage WHERE false"
+                )
+        if state is not None:
+            matches = " AND ".join(f"old.{quote(k)} = new.{quote(k)}" for k in keys)
+            names = tuple(
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info('_stellar_stage')").fetchall()
+            )
+            changes = " OR ".join(
+                f"old.{quote(name)} IS DISTINCT FROM new.{quote(name)}" for name in names
+            )
+            self._assert_empty(
+                model,
+                "conflicting payload at the same cursor",
+                f"""SELECT 1 FROM {stored} old JOIN _stellar_stage new ON {matches}
+                    WHERE old.{cursor} = new.{cursor} AND ({changes})""",
+            )
+            self.connection.execute(
+                f"""CREATE OR REPLACE TEMP TABLE _stellar_merged AS
+                    SELECT {", ".join("old." + quote(n) for n in names)}
+                    FROM {stored} old
+                    WHERE NOT EXISTS (SELECT 1 FROM _stellar_stage new WHERE {matches})
+                    UNION ALL SELECT {columns} FROM _stellar_stage"""
+            )
+        maximum = self.connection.execute(f"SELECT max({cursor}) FROM _stellar_stage").fetchone()
+        if maximum is not None and maximum[0] is not None:
+            self.connection.execute(
+                "UPDATE _stellar.model_state SET watermark = ? WHERE model_name = ?",
+                [maximum[0], model.name],
+            )
+        if state is not None:
+            self.connection.execute("DELETE FROM _stellar_stage")
+            self.connection.execute("INSERT INTO _stellar_stage SELECT * FROM _stellar_merged")
+            self.connection.execute("DROP TABLE _stellar_merged")
+        if history is not None:
+            self.connection.execute(f"DELETE FROM {stored}")
+            self.connection.execute(f"INSERT INTO {stored} SELECT * FROM _stellar_stage")
+
+    def _history(self, model: Dimension) -> None:
+        history = model.history
+        assert history is not None
+        start, end = quote(history.valid_from), quote(history.valid_to)
+        groups = ", ".join(quote(name) for name in model.business_key)
+        comparisons = " OR ".join(
+            f"{quote(name)} IS DISTINCT FROM lag({quote(name)}) OVER versions"
+            for name in history.tracked_columns
+        )
+        identity = ", ".join([*(quote(name) for name in model.business_key), f"epoch_us({start})"])
+        self.connection.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _stellar_versions AS
+            WITH marked AS (
+                SELECT *,
+                       row_number() OVER versions = 1 OR ({comparisons}) AS _changed
+                FROM _stellar_stage
+                WINDOW versions AS (PARTITION BY {groups} ORDER BY {start})
+            ), changes AS (
+                SELECT * EXCLUDE (_changed) FROM marked WHERE _changed
+            )
+            SELECT *, md5(json_array({identity})) AS {quote(model.surrogate_key)},
+                   lead({start}) OVER versions AS {end},
+                   lead({start}) OVER versions IS NULL AS {quote(history.current_flag)}
+            FROM changes
+            WINDOW versions AS (PARTITION BY {groups} ORDER BY {start})
+        """)
+        self.connection.execute("DROP TABLE _stellar_stage")
+        self.connection.execute("ALTER TABLE _stellar_versions RENAME TO _stellar_stage")
+
+    def _temporal(self, model: Fact, registry: dict[str, Table]) -> None:
+        for lookup in model.temporal_lookups:
+            target = registry[lookup.target]
+            assert isinstance(target, Dimension) and target.history is not None
+            history = target.history
+            event = f"src.{quote(lookup.time_column)}"
+            event_type = next(c.data_type for c in model.columns if c.name == lookup.time_column)
+            if event_type == DataType.DATE:
+                event = f"(CAST({event} AS TIMESTAMP) AT TIME ZONE 'UTC')"
+            self._assert_empty(
+                model,
+                "temporal event time must be finite",
+                f"SELECT 1 FROM _stellar_stage src WHERE NOT isfinite({event})",
+            )
+            keys = " AND ".join(
+                f"src.{quote(source)} = dst.{quote(destination)}"
+                for source, destination in zip(lookup.columns, target.business_key, strict=True)
+            )
+            predicate = (
+                f"{keys} AND {event} >= dst.{quote(history.valid_from)} "
+                f"AND ({event} < dst.{quote(history.valid_to)} "
+                f"OR dst.{quote(history.valid_to)} IS NULL)"
+            )
+            self._assert_empty(
+                model,
+                f"missing temporal version in {target.name}",
+                f"""SELECT 1 FROM _stellar_stage src
+                    WHERE (SELECT count(*) FROM {relation(target.name)} dst
+                           WHERE {predicate}) <> 1""",
+            )
+            self.connection.execute(f"""
+                CREATE OR REPLACE TEMP TABLE _stellar_resolved AS
+                SELECT src.*, dst.{quote(target.surrogate_key)} AS {quote(lookup.surrogate_column)}
+                FROM _stellar_stage src JOIN {relation(target.name)} dst ON {predicate}
+            """)
+            self.connection.execute("DROP TABLE _stellar_stage")
+            self.connection.execute("ALTER TABLE _stellar_resolved RENAME TO _stellar_stage")

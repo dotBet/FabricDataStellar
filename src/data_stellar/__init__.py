@@ -1,4 +1,5 @@
 from data_stellar.models import (
+    SCD2,
     Aggregation,
     Allocation,
     Bridge,
@@ -7,11 +8,13 @@ from data_stellar.models import (
     DataType,
     Dimension,
     Fact,
+    Incremental,
     Mart,
     Measure,
     ModelError,
     Reference,
     Table,
+    TemporalLookup,
 )
 
 __all__ = [
@@ -23,9 +26,12 @@ __all__ = [
     "DataType",
     "Dimension",
     "Fact",
+    "Incremental",
     "Mart",
     "Measure",
     "ModelError",
     "Reference",
+    "SCD2",
     "Table",
+    "TemporalLookup",
 ]
